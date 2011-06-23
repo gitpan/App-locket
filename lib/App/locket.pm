@@ -1,6 +1,6 @@
 package App::locket;
 BEGIN {
-  $App::locket::VERSION = '0.0001';
+  $App::locket::VERSION = '0.0012';
 }
 # ABSTRACT: Copy secrets from a YAML/JSON cipherstore into the clipboard (pbcopy, xsel, xclip)
 
@@ -434,7 +434,7 @@ App::locket - Copy secrets from a YAML/JSON cipherstore into the clipboard (pbco
 
 =head1 VERSION
 
-version 0.0001
+version 0.0012
 
 =head1 SYNOPSIS
 
@@ -470,6 +470,39 @@ App::locket is best used with:
 * openssl.vim (L<http://www.vim.org/scripts/script.php?script_id=2012>)
 
 * EasyPG (L<http://www.emacswiki.org/emacs/AutoEncryption>)
+
+=head1 SECURITY
+
+=head2 Encryption/decryption algorithm
+
+App::locket defers actual encryption/decryption to external tools. The choice of the actual
+cipher/encryption method is left up to you
+
+If you're using GnuPG, then you could use C<gpg-agent> for passphrase prompting and limited retention
+
+=head2 In-memory encryption
+
+App::locket does not perform any in-memory encryption; once the cipherstore is loaded it is exposed in memory
+
+In addition, if the process is swapped out while running then the plaintextstore could be written to disk
+
+Encrypting swap is one way of mitigating this problem (secure virtual memory)
+
+=head2 Clipboard access
+
+App::locket uses third-party tools for read/write access to the clipboard. It tries to detect if
+pbcopy, xsel, or xclip are available. It does this by looking in /bin, /usr/bin, and /usr/local/bin in that order.
+
+It will NOT search $PATH
+
+=head2 Purging the clipboard
+
+By default, App::locket will purge the clipboard of a secret it put there after a set delay. It will try to verify that it is
+wiping what it put there in the first place (so it doesn't accidentally erase something else you copied)
+
+If for some reason App::locket cannot read from the clipboard, it will purge it just in case
+
+If you prematurely cancel a secret copying operation via CTRL-C, App::locket will catch the signal and purge the clipboard first
 
 =head1 INSTALL
 
