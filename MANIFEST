@@ -1,0 +1,7 @@
+MANIFEST
+META.yml
+Makefile.PL
+README
+bin/locket
+lib/App/locket.pm
+t/01-basic.t

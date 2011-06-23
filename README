@@ -1,0 +1,107 @@
+NAME
+    App::locket - Copy secrets from a YAML/JSON cipherstore into the
+    clipboard (pbcopy, xsel, xclip)
+
+VERSION
+    version 0.0001
+
+SYNOPSIS
+        # Setup the configuration file for the cipherstore:
+        # (How to read the cipherstore, how to edit the cipherstore, etc.)
+        $ locket setup
+
+        # Add or change data in the cipherstore:
+        $ locket edit
+
+        # List all the entries in the cipherstore:
+        $ locket /
+
+        # Show a secret from the cipherstore:
+        $ locket /alice@gmail
+
+        # Copy an entry from the cipherstore into the clipboard:
+        # (The clipboard will be purged after 10 seconds)
+        $ locket --copy --delay 10 /alice@gmail
+
+DESCRIPTION
+    App::locket is a tool for querying a simple YAML/JSON-based cipherstore
+
+    It has a simple commandline-based querying method and supports copying
+    into the clipboard
+
+    Currently, encryption and decryption is performed via external tools
+    (e.g. GnuPG, OpenSSL, etc.)
+
+    App::locket is best used with:
+
+    * gnupg.vim (<http://www.vim.org/scripts/script.php?script_id=661>)
+
+    * openssl.vim (<http://www.vim.org/scripts/script.php?script_id=2012>)
+
+    * EasyPG (<http://www.emacswiki.org/emacs/AutoEncryption>)
+
+INSTALL
+        $ cpanm -i App::locket
+
+INSTALL cpanm
+    <http://search.cpan.org/perldoc?App::cpanminus#INSTALLATION>
+
+USAGE
+        locket [options] setup|edit|<query>
+
+            --copy              Copy value to clipboard using pbcopy, xsel, or xclip
+
+            --delay <delay>     Keep value in clipboard for <delay> seconds
+                                If value is still in the clipboard at the end of
+                                <delay> then it will be automatically wiped from
+                                the clipboard
+
+            setup               Setup a new or edit an existing user configuration
+                                file (~/.locket/cfg)
+
+            edit                Edit the cipherstore
+                                The configuration must have an "edit" value, e.g.:
+
+                                    /usr/bin/vim -n ~/.locket.gpg
+
+
+            <query>             Search the cipherstore for <query> and emit the
+                                resulting secret
+                            
+                                The configuration must have a "source" value to
+                                tell it how to read the cipherstore. Only piped
+                                commands are supported today, and they should
+                                be something like:
+
+                                    </usr/local/bin/gpg -q --no-tty -d ~/.locket.gpg'
+
+                                If the found key in the cipherstore is of the format
+                                "<username>@<site>" then the username will be emitted
+                                first before the secret (which is assumed to be a password/passphrase)
+
+Example YAML cipherstore
+        %YAML 1.1
+        ---
+        # A GMail identity
+        alice@gmail: p455w0rd
+        # Some frequently used credit card information
+        cc4123: |
+            4123412341234123
+            01/23
+            123
+
+Example configuration file
+        %YAML 1.1
+        ---
+        source: '</usr/local/bin/gpg --no-tty --decrypt --quiet ~/.locket.gpg'
+        edit: '/usr/bin/vim -n ~/.locket.gpg'
+
+AUTHOR
+    Robert Krimen <robertkrimen@gmail.com>
+
+COPYRIGHT AND LICENSE
+    This software is copyright (c) 2011 by Robert Krimen.
+
+    This is free software; you can redistribute it and/or modify it under
+    the same terms as the Perl 5 programming language system itself.
+
