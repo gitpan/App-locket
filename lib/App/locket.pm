@@ -1,6 +1,6 @@
 package App::locket;
 BEGIN {
-  $App::locket::VERSION = '0.0012';
+  $App::locket::VERSION = '0.0013';
 }
 # ABSTRACT: Copy secrets from a YAML/JSON cipherstore into the clipboard (pbcopy, xsel, xclip)
 
@@ -17,7 +17,9 @@ use YAML::XS();
 use File::Temp;
 use Term::EditorEdit;
 use Try::Tiny;
-my $usage = <<_END_;
+my $usage;
+BEGIN {
+$usage = <<_END_;
 
     Usage: locket [options] setup|edit|<query>
 
@@ -28,6 +30,8 @@ my $usage = <<_END_;
                             <delay> then it will be automatically wiped from
                             the clipboard
 
+        --cfg <file>        Use <file> for configuration
+
         setup               Setup a new or edit an existing user configuration
                             file (~/.locket/cfg)
 
@@ -36,11 +40,10 @@ my $usage = <<_END_;
 
                                 /usr/bin/vim -n ~/.locket.gpg
 
-
         <query>             Search the cipherstore for <query> and emit the
                             resulting secret
                             
-                            The configuration must have a "source" value to
+                            The configuration must have a "read" value to
                             tell it how to read the cipherstore. Only piped
                             commands are supported today, and they should
                             be something like:
@@ -64,9 +67,17 @@ my $usage = <<_END_;
                 123
 
 _END_
+}
 use Getopt::Usaginator $usage;
 
-END { ReadMode 0 }
+END {
+    ReadMode 0;
+}
+
+BEGIN {
+    # Safe path
+    $ENV{ PATH } = '/bin:/usr/bin:/usr/local/bin';
+}
 
 my %default_options = (
     delay => 45,
@@ -85,6 +96,9 @@ sub _build_home {
 has cfg_file => qw/ is ro lazy_build 1 /;
 sub _build_cfg_file {
     my $self = shift;
+    if ( defined ( my $file = $self->argument_options->{ cfg } ) ) {
+        return file $file;
+    }
     my $home = $self->home;
     return unless $home;
     return $home->file( 'cfg' );
@@ -99,6 +113,7 @@ sub _build_cfg {
 sub read_cfg {
     my $self = shift;
     return unless my $cfg_file = $self->cfg_file;
+    return unless -f $cfg_file && -r $cfg_file;
     return scalar $cfg_file->slurp;
 }
 
@@ -114,6 +129,11 @@ sub reload_cfg {
     $self->_cfg( $self->load_cfg );
 }
 
+has argument_options => qw/ is ro lazy_build 1 /;
+sub _build_argument_options {
+    return {};
+}
+
 has options => qw/ is ro lazy_build 1 /;
 sub _build_options {
     my $self = shift;
@@ -122,27 +142,44 @@ sub _build_options {
     my @options;
     defined $cfg->{ $_ } && length $cfg->{ $_ } and push @options, $_ => $cfg->{ $_ } for qw/ delay /;
 
-    return { %default_options, @options };
+    my %argument_options = %{ $self->argument_options };
+
+    return { %default_options, @options, %argument_options };
 }
 
 sub dispatch {
     my $self = shift;
     my @arguments = @_;
 
+    my $options = $self->argument_options;
+    my ( $help );
+    Getopt::Usaginator->parse( \@arguments,
+        'copy' => \$options->{ copy },
+        'delay=s' => \$options->{ delay },
+        'help|h' => \$help,
+        'cfg|config=s' => \$options->{ cfg },
+    );
+    $options = $self->options;
+
     if ( ! @arguments ) {
-        $self->stdout( $usage );
+        my $cfg_file = $self->cfg_file;
+        my $cfg_file_size = -f $cfg_file && -s _;
+        defined && length or $_ = '-1' for $cfg_file_size;
+        my ( $read, $edit ) = map { defined $_ ? $_ : '-' } @{ $self->cfg }{qw/ read edit /};
+
+        $self->stdout( <<_END_ );
+App::locket @{[ $App::locket::VERSION || '0.0' ]}
+
+    $cfg_file ($cfg_file_size)
+
+      Read cipherstore: $read
+      Edit cipherstore: $edit
+
+_END_
     }
     else {
 
-        my $options = $self->options;
-        my ( $help );
-        Getopt::Usaginator->parse( \@arguments,
-            'copy' => \$options->{ copy },
-            'delay=s' => \$options->{ delay },
-            'help|h' => \$help,
-        );
-
-        return usage 0 if $help || $arguments[0] eq 'help';
+        usage 0 if $help || $arguments[ 0 ] eq 'help';
 
         $options->{ delay } ||= 0;
         if ( $options->{ delay } !~ m/^\d+$/ ) {
@@ -159,8 +196,8 @@ sub dispatch {
                 $cfg_content = <<_END_;
 %YAML 1.1
 ---
-#source: '</usr/bin/gpg -d <file>'
-#source: '</usr/bin/openssl des3 -d -in <file>'
+#read: '</usr/bin/gpg -d <file>'
+#read: '</usr/bin/openssl des3 -d -in <file>'
 #edit: '/usr/bin/vim -n <file>'
 _END_
             }
@@ -181,23 +218,23 @@ _END_
             }
         }
         else {
-            my $source = $self->cfg->{ source };
+            my $read = $self->cfg->{ read };
             my $store;
-            if ( $source =~ m/^\s*[|<]/ ) {
-                ( my $pipe = $source ) =~ s/^\s*[|<]//;
+            if ( $read =~ m/^\s*[|<]/ ) {
+                ( my $pipe = $read ) =~ s/^\s*[|<]//;
                 open my $cipher, '-|', $pipe;
                 my $plaintext_store = join '', <$cipher>;
                 try {
                     if ( $plaintext_store =~ m/^\s*\{/ )
-                                    { $store = $JSON->decode( $plaintext_store ) }
-                    else            { $store = YAML::XS::Load( "$plaintext_store\n" ) }
+                            { $store = $JSON->decode( $plaintext_store ) }
+                    else    { $store = YAML::XS::Load( "$plaintext_store\n" ) }
                 };
                 if ( ! $store ) {
                     die "*** Unable to read store";
                 }
             }
             else {
-                die "*** Invalid source ($source)";
+                die "*** Invalid read ($read)";
             }
 
             my $target = $_0;
@@ -411,14 +448,14 @@ sub emit_secret {
 sub stdout {
     my $self = shift;
     my $emit = join '', @_;
-    $emit =~ s/\n+$//;
+    chomp $emit;
     print STDOUT $emit, "\n";
 }
 
 sub stderr {
     my $self = shift;
     my $emit = join '', @_;
-    $emit =~ s/\n+$//;
+    chomp $emit;
     print STDERR $emit, "\n";
 }
 
@@ -434,7 +471,7 @@ App::locket - Copy secrets from a YAML/JSON cipherstore into the clipboard (pbco
 
 =head1 VERSION
 
-version 0.0012
+version 0.0013
 
 =head1 SYNOPSIS
 
@@ -465,11 +502,11 @@ Currently, encryption and decryption is performed via external tools (e.g. GnuPG
 
 App::locket is best used with:
 
-* gnupg.vim (L<http://www.vim.org/scripts/script.php?script_id=661>) 
+* gnupg.vim L<http://www.vim.org/scripts/script.php?script_id=661>
 
-* openssl.vim (L<http://www.vim.org/scripts/script.php?script_id=2012>)
+* openssl.vim L<http://www.vim.org/scripts/script.php?script_id=2012>
 
-* EasyPG (L<http://www.emacswiki.org/emacs/AutoEncryption>)
+* EasyPG L<http://www.emacswiki.org/emacs/AutoEncryption>
 
 =head1 SECURITY
 
@@ -491,7 +528,7 @@ Encrypting swap is one way of mitigating this problem (secure virtual memory)
 =head2 Clipboard access
 
 App::locket uses third-party tools for read/write access to the clipboard. It tries to detect if
-pbcopy, xsel, or xclip are available. It does this by looking in /bin, /usr/bin, and /usr/local/bin in that order.
+pbcopy, xsel, or xclip are available. It does this by looking in /bin, /usr/bin, and /usr/local/bin (in that order)
 
 It will NOT search $PATH
 
@@ -535,7 +572,7 @@ L<http://search.cpan.org/perldoc?App::cpanminus#INSTALLATION>
         <query>             Search the cipherstore for <query> and emit the
                             resulting secret
                             
-                            The configuration must have a "source" value to
+                            The configuration must have a "read" value to
                             tell it how to read the cipherstore. Only piped
                             commands are supported today, and they should
                             be something like:
@@ -562,7 +599,7 @@ L<http://search.cpan.org/perldoc?App::cpanminus#INSTALLATION>
 
     %YAML 1.1
     ---
-    source: '</usr/local/bin/gpg --no-tty --decrypt --quiet ~/.locket.gpg'
+    read: '</usr/local/bin/gpg --no-tty --decrypt --quiet ~/.locket.gpg'
     edit: '/usr/bin/vim -n ~/.locket.gpg'
 
 =head1 AUTHOR

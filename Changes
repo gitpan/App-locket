@@ -1,0 +1,8 @@
+0.0013 Thursday June 23 19:48:53 PDT 2011
+    - Allow custom cfg location
+    - Added some security considerations
+    - Sanitize $PATH before reading
+
+0.0001 Thursday June 23 2011:
+    - Initial release
+

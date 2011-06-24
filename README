@@ -3,7 +3,7 @@ NAME
     clipboard (pbcopy, xsel, xclip)
 
 VERSION
-    version 0.0012
+    version 0.0013
 
 SYNOPSIS
         # Setup the configuration file for the cipherstore:
@@ -34,11 +34,11 @@ DESCRIPTION
 
     App::locket is best used with:
 
-    * gnupg.vim (<http://www.vim.org/scripts/script.php?script_id=661>)
+    * gnupg.vim <http://www.vim.org/scripts/script.php?script_id=661>
 
-    * openssl.vim (<http://www.vim.org/scripts/script.php?script_id=2012>)
+    * openssl.vim <http://www.vim.org/scripts/script.php?script_id=2012>
 
-    * EasyPG (<http://www.emacswiki.org/emacs/AutoEncryption>)
+    * EasyPG <http://www.emacswiki.org/emacs/AutoEncryption>
 
 SECURITY
   Encryption/decryption algorithm
@@ -61,8 +61,8 @@ SECURITY
   Clipboard access
     App::locket uses third-party tools for read/write access to the
     clipboard. It tries to detect if pbcopy, xsel, or xclip are available.
-    It does this by looking in /bin, /usr/bin, and /usr/local/bin in that
-    order.
+    It does this by looking in /bin, /usr/bin, and /usr/local/bin (in that
+    order)
 
     It will NOT search $PATH
 
@@ -106,7 +106,7 @@ USAGE
             <query>             Search the cipherstore for <query> and emit the
                                 resulting secret
                             
-                                The configuration must have a "source" value to
+                                The configuration must have a "read" value to
                                 tell it how to read the cipherstore. Only piped
                                 commands are supported today, and they should
                                 be something like:
@@ -131,7 +131,7 @@ Example YAML cipherstore
 Example configuration file
         %YAML 1.1
         ---
-        source: '</usr/local/bin/gpg --no-tty --decrypt --quiet ~/.locket.gpg'
+        read: '</usr/local/bin/gpg --no-tty --decrypt --quiet ~/.locket.gpg'
         edit: '/usr/bin/vim -n ~/.locket.gpg'
 
 AUTHOR
