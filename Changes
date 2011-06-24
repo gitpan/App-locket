@@ -1,4 +1,12 @@
-0.0013 Thursday June 23 19:48:53 PDT 2011
+TODO:
+    Make cfg 0600, check to see if 0600?
+    Make configuration (editor/reader) more secure, too powerful right now
+
+0.0014 Friday June 24 10:13:51 PDT 2011:
+    - Added read command to emit plainstore onto stdout
+    - Added --safety command to prompt before emitting sensitive data
+
+0.0013 Thursday June 23 19:48:53 PDT 2011:
     - Allow custom cfg location
     - Added some security considerations
     - Sanitize $PATH before reading

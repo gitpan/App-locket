@@ -1,6 +1,6 @@
 package App::locket;
 BEGIN {
-  $App::locket::VERSION = '0.0013';
+  $App::locket::VERSION = '0.0014';
 }
 # ABSTRACT: Copy secrets from a YAML/JSON cipherstore into the clipboard (pbcopy, xsel, xclip)
 
@@ -30,20 +30,25 @@ $usage = <<_END_;
                             <delay> then it will be automatically wiped from
                             the clipboard
 
+        --safety            Turn the safety on. This will prompt
+                            before emitting any sensitive information in
+                            plaintext and give an oppurtunity to
+                            abort (via CTRL-C)
+
         --cfg <file>        Use <file> for configuration
 
         setup               Setup a new or edit an existing user configuration
                             file (~/.locket/cfg)
 
         edit                Edit the cipherstore
-                            The configuration must have an "edit" value, e.g.:
+                            The configuration must have an "editor" value, e.g.:
 
                                 /usr/bin/vim -n ~/.locket.gpg
 
         <query>             Search the cipherstore for <query> and emit the
                             resulting secret
                             
-                            The configuration must have a "read" value to
+                            The configuration must have a "reader" value to
                             tell it how to read the cipherstore. Only piped
                             commands are supported today, and they should
                             be something like:
@@ -158,6 +163,7 @@ sub dispatch {
         'delay=s' => \$options->{ delay },
         'help|h' => \$help,
         'cfg|config=s' => \$options->{ cfg },
+        'safety' => \$options->{ safety },
     );
     $options = $self->options;
 
@@ -165,15 +171,15 @@ sub dispatch {
         my $cfg_file = $self->cfg_file;
         my $cfg_file_size = -f $cfg_file && -s _;
         defined && length or $_ = '-1' for $cfg_file_size;
-        my ( $read, $edit ) = map { defined $_ ? $_ : '-' } @{ $self->cfg }{qw/ read edit /};
+        my ( $reader, $editor ) = map { defined $_ ? $_ : '-' } @{ $self->cfg }{qw/ reader editor /};
 
         $self->stdout( <<_END_ );
 App::locket @{[ $App::locket::VERSION || '0.0' ]}
 
     $cfg_file ($cfg_file_size)
 
-      Read cipherstore: $read
-      Edit cipherstore: $edit
+      Read cipherstore: $reader
+      Edit cipherstore: $editor
 
 _END_
     }
@@ -196,9 +202,9 @@ _END_
                 $cfg_content = <<_END_;
 %YAML 1.1
 ---
-#read: '</usr/bin/gpg -d <file>'
-#read: '</usr/bin/openssl des3 -d -in <file>'
-#edit: '/usr/bin/vim -n <file>'
+#reader: '</usr/bin/gpg -d <file>'
+#reader: '</usr/bin/openssl des3 -d -in <file>'
+#editor: '/usr/bin/vim -n <file>'
 _END_
             }
             my $file = File::Temp->new( template => '.locket.cfg.XXXXXXX', dir => '.', unlink => 0 ); # TODO A better dir?
@@ -209,66 +215,89 @@ _END_
             }
         }
         elsif ( $_0 eq 'edit' ) {
-            my $edit = $self->cfg->{ edit };
-            if ( defined $edit && length $edit ) {
-                system( $edit );
+            my $editor = $self->cfg->{ editor };
+            if ( defined $editor && length $editor ) {
+                system( $editor );
             }
             else {
-                $self->stderr( "% Missing (edit) in cfg" );
+                $self->stderr( "% Missing (editor) in cfg" );
+            }
+        }
+        elsif ( $_0 eq 'read' ) {
+            if ( $self->check_read ) {
+                my $plainstore = $self->read;
+                $self->safe_stdout( $plainstore );
             }
         }
         else {
-            my $read = $self->cfg->{ read };
-            my $store;
-            if ( $read =~ m/^\s*[|<]/ ) {
-                ( my $pipe = $read ) =~ s/^\s*[|<]//;
-                open my $cipher, '-|', $pipe;
-                my $plaintext_store = join '', <$cipher>;
+            if ( $self->check_read ) {
+                my $plainstore = $self->read;
+                my $store;
                 try {
-                    if ( $plaintext_store =~ m/^\s*\{/ )
-                            { $store = $JSON->decode( $plaintext_store ) }
-                    else    { $store = YAML::XS::Load( "$plaintext_store\n" ) }
+                    if ( $plainstore =~ m/^\s*\{/ )
+                            { $store = $JSON->decode( $plainstore ) }
+                    else    { $store = YAML::XS::Load( $plainstore ) }
                 };
-                if ( ! $store ) {
-                    die "*** Unable to read store";
+                die sprintf "*** Unable to parse store (%d)", length $plainstore if !$store;
+
+                my $target = $_0;
+                $target =~ s/^\///;
+                my @found = ( $store->{ $target } );
+
+                if ( !length $target ) {
+                    @found = sort keys %$store;
                 }
-            }
-            else {
-                die "*** Invalid read ($read)";
-            }
-
-            my $target = $_0;
-            $target =~ s/^\///;
-            my @found = ( $store->{ $target } );
-
-            if ( !length $target ) {
-                @found = sort keys %$store;
-            }
-            elsif ( defined $store->{ $target } ) {
-                @found = ( $target );
-            }
-            else {
-                @found = sort grep { m/\Q$target\E/ } keys %$store;
-            }
-
-            if ( 1 == @found ) {
-                my $found = $found[0];
-                my $secret = $store->{ $found };
-                if ( $found =~ m/^([^@]+)@/ ) {
-                    $self->emit_username_password( $1, $secret );
+                elsif ( defined $store->{ $target } ) {
+                    @found = ( $target );
                 }
                 else {
-                    $self->emit_secret( $secret );
+                    @found = sort grep { m/\Q$target\E/ } keys %$store;
+                }
+
+                if ( 1 == @found ) {
+                    my $found = $found[0];
+                    my $secret = $store->{ $found };
+                    if ( $found =~ m/^([^@]+)@/ ) {
+                        $self->emit_username_password( $1, $secret );
+                    }
+                    else {
+                        $self->emit_secret( $secret );
+                    }
+                }
+                elsif ( 0 == @found ) {
+                    $self->stdout( "# No matches for \"$target\"" );
+                }
+                else {
+                    $self->stdout( "# Found for \"$target\":" ) if length $target;
+                    $self->stdout( "    $_" ) for @found;
                 }
             }
-            elsif ( 0 == @found ) {
-                $self->stdout( "# No matches for \"$target\"" );
-            }
-            else {
-                $self->stdout( "# Found for \"$target\":" ) if length $target;
-                $self->stdout( "    $_" ) for @found;
-            }
         }
+    }
+}
+
+sub check_read {
+    my $self = shift;
+    local $_ = $self->cfg->{ reader };
+    return 1 if defined and m/\S/;
+    $self->stderr( "% Missing (reader) in cfg" );
+    return 0;
+}
+
+sub read {
+    my $self = shift;
+
+    my $reader = $self->cfg->{ reader };
+    $reader = '' unless defined $reader;
+    if ( $reader =~ m/^\s*[|<]/ ) {
+        ( my $pipe = $reader ) =~ s/^\s*[|<]//;
+        open my $cipher, '-|', $pipe;
+        my $plainstore = join '', <$cipher>;
+        chomp $plainstore;
+        return "$plainstore\n";
+    }
+    else {
+        die "*** Unknown/invalid reader ($reader)";
     }
 }
 
@@ -426,7 +455,7 @@ sub emit_username_password {
         $self->copy( password => $password );
     }
     else {
-        $self->stdout( <<_END_ );
+        $self->safe_stdout( <<_END_ );
 $username
 $password
 _END_
@@ -441,7 +470,7 @@ sub emit_secret {
         $self->copy( secret => $secret );
     }
     else {
-        $self->stdout( $secret, "\n" );
+        $self->safe_stdout( $secret, "\n" );
     }
 }
 
@@ -450,6 +479,21 @@ sub stdout {
     my $emit = join '', @_;
     chomp $emit;
     print STDOUT $emit, "\n";
+}
+
+sub safe_stdout {
+    my $self = shift;
+    if ( $self->options->{ safety } ) {
+        $self->stdout( "# Press ENTER to continue (emitting plaintext)" );
+        ReadMode 2; # Disable keypress echo
+        while ( 1 ) {
+            my $continue = ReadKey 0;
+            chomp $continue;
+            last unless length $continue;
+        }
+        ReadMode 0;
+    }
+    $self->stdout( @_ );
 }
 
 sub stderr {
@@ -471,7 +515,7 @@ App::locket - Copy secrets from a YAML/JSON cipherstore into the clipboard (pbco
 
 =head1 VERSION
 
-version 0.0013
+version 0.0014
 
 =head1 SYNOPSIS
 
@@ -510,7 +554,7 @@ App::locket is best used with:
 
 =head1 SECURITY
 
-=head2 Encryption/decryption algorithm
+=head2 Encryption/decryption
 
 App::locket defers actual encryption/decryption to external tools. The choice of the actual
 cipher/encryption method is left up to you
@@ -541,6 +585,11 @@ If for some reason App::locket cannot read from the clipboard, it will purge it 
 
 If you prematurely cancel a secret copying operation via CTRL-C, App::locket will catch the signal and purge the clipboard first
 
+=head2 Attack via configuration
+
+Currently, App::locket does not encrypt/protect the configuration file. This means an attacker can potentially (unknown to you) modify
+the reading/editing commands to divert the plaintext elsewhere
+
 =head1 INSTALL
 
     $ cpanm -i App::locket
@@ -564,7 +613,7 @@ L<http://search.cpan.org/perldoc?App::cpanminus#INSTALLATION>
                             file (~/.locket/cfg)
 
         edit                Edit the cipherstore
-                            The configuration must have an "edit" value, e.g.:
+                            The configuration must have an "editor" value, e.g.:
 
                                 /usr/bin/vim -n ~/.locket.gpg
 
@@ -572,7 +621,7 @@ L<http://search.cpan.org/perldoc?App::cpanminus#INSTALLATION>
         <query>             Search the cipherstore for <query> and emit the
                             resulting secret
                             
-                            The configuration must have a "read" value to
+                            The configuration must have a "reader" value to
                             tell it how to read the cipherstore. Only piped
                             commands are supported today, and they should
                             be something like:
@@ -599,8 +648,8 @@ L<http://search.cpan.org/perldoc?App::cpanminus#INSTALLATION>
 
     %YAML 1.1
     ---
-    read: '</usr/local/bin/gpg --no-tty --decrypt --quiet ~/.locket.gpg'
-    edit: '/usr/bin/vim -n ~/.locket.gpg'
+    reader: '</usr/local/bin/gpg --no-tty --decrypt --quiet ~/.locket.gpg'
+    editor: '/usr/bin/vim -n ~/.locket.gpg'
 
 =head1 AUTHOR
 
