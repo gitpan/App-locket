@@ -4,7 +4,7 @@ use warnings;
 
 
 
-use ExtUtils::MakeMaker 6.31;
+use ExtUtils::MakeMaker 6.30;
 
 
 
@@ -15,7 +15,7 @@ my %WriteMakefileArgs = (
     'Test::Most' => '0'
   },
   'CONFIGURE_REQUIRES' => {
-    'ExtUtils::MakeMaker' => '6.31'
+    'ExtUtils::MakeMaker' => '6.30'
   },
   'DISTNAME' => 'App-locket',
   'EXE_FILES' => [
@@ -26,9 +26,14 @@ my %WriteMakefileArgs = (
   'NAME' => 'App::locket',
   'PREREQ_PM' => {
     'Any::Moose' => '0',
+    'Crypt::Random' => '0',
+    'Crypt::Rijndael' => '0',
+    'Digest::SHA' => '0',
     'File::HomeDir' => '0',
     'Getopt::Usaginator' => '0',
+    'Hash::Dispatch' => '0',
     'JSON' => '0',
+    'MIME::Base64' => '0',
     'Path::Class' => '0',
     'String::Util' => '0',
     'Term::EditorEdit' => '0',
@@ -36,7 +41,7 @@ my %WriteMakefileArgs = (
     'Try::Tiny' => '0',
     'YAML::XS' => '0'
   },
-  'VERSION' => '0.0014',
+  'VERSION' => '0.0020',
   'test' => {
     'TESTS' => 't/*.t'
   }

@@ -1,6 +1,19 @@
 TODO:
-    Make cfg 0600, check to see if 0600?
-    Make configuration (editor/reader) more secure, too powerful right now
+    - Make cfg 0600, check to see if 0600?
+    - Backspace away the prompt
+    - Better display post-edit, post-cfg
+
+0.0020:
+    - Better navigation (interface overhaul)
+    - Better querying /, //, .., .
+    - More: help, reset, show, copy, show #, copy #, etc.
+    - Added randomart fingerprint of configuration
+    - Added lock/unlock option for configuration (but recommend VM)
+    - Code cleanup, reorganization
+    - Added tests
+
+0.0015:
+    - Made $PATH more restrictive (/bin:/usr/bin)
 
 0.0014 Friday June 24 10:13:51 PDT 2011:
     - Added read command to emit plainstore onto stdout

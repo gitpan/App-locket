@@ -1,22 +1,29 @@
 package App::locket;
 BEGIN {
-  $App::locket::VERSION = '0.0014';
+  $App::locket::VERSION = '0.0020';
 }
 # ABSTRACT: Copy secrets from a YAML/JSON cipherstore into the clipboard (pbcopy, xsel, xclip)
 
 use strict;
 use warnings;
 
-use Any::Moose;
+BEGIN {
+    # Safe path
+    $ENV{ PATH } = '/bin:/usr/bin';
+}
 
+use Term::ReadKey;
+END {
+    ReadMode 0;
+}
 use File::HomeDir;
 use Path::Class;
-use Term::ReadKey;
 use JSON; my $JSON = JSON->new->pretty;
 use YAML::XS();
 use File::Temp;
 use Term::EditorEdit;
 use Try::Tiny;
+use String::Util qw/ trim /;
 my $usage;
 BEGIN {
 $usage = <<_END_;
@@ -30,9 +37,9 @@ $usage = <<_END_;
                             <delay> then it will be automatically wiped from
                             the clipboard
 
-        --safety            Turn the safety on. This will prompt
+        --unsafe            Turn the safety off. This will disable prompting
                             before emitting any sensitive information in
-                            plaintext and give an oppurtunity to
+                            plaintext. There will be no opportunity to
                             abort (via CTRL-C)
 
         --cfg <file>        Use <file> for configuration
@@ -45,7 +52,7 @@ $usage = <<_END_;
 
                                 /usr/bin/vim -n ~/.locket.gpg
 
-        <query>             Search the cipherstore for <query> and emit the
+        /<query>            Search the cipherstore for <query> and emit the
                             resulting secret
                             
                             The configuration must have a "reader" value to
@@ -74,19 +81,36 @@ $usage = <<_END_;
 _END_
 }
 use Getopt::Usaginator $usage;
+use Digest::SHA qw/ sha1_hex sha512_hex /;
+use List::MoreUtils qw/ :all /;
+use Hash::Dispatch;
 
-END {
-    ReadMode 0;
-}
+use App::locket::Locket;
+use App::locket::TextRandomart;
+use App::locket::Util;
 
-BEGIN {
-    # Safe path
-    $ENV{ PATH } = '/bin:/usr/bin:/usr/local/bin';
-}
+use App::locket::Moose;
+
+my %n2k = (
+    ( map { $_ => $_ + 1 } 0 .. 8 ),
+    9 => 0,
+);
+my %k2n = map { trim $_ } reverse %n2k;
 
 my %default_options = (
     delay => 45,
 );
+
+has locket => qw/ reader locket writer _locket isa App::locket::Locket lazy_build 1 /, handles =>
+    [qw/
+        cfg plaincfg write_cfg can_read read passphrase require_passphrase
+        store
+    /];
+sub _build_locket {
+    my $self = shift;
+    my $locket = App::locket::Locket->open( $self->cfg_file );
+    return $locket;
+}
 
 has home => qw/ is ro lazy_build 1 /;
 sub _build_home {
@@ -98,7 +122,7 @@ sub _build_home {
     return $home;
 }
 
-has cfg_file => qw/ is ro lazy_build 1 /;
+has_file cfg_file => qw/ is ro lazy_build 1 /;
 sub _build_cfg_file {
     my $self = shift;
     if ( defined ( my $file = $self->argument_options->{ cfg } ) ) {
@@ -107,31 +131,6 @@ sub _build_cfg_file {
     my $home = $self->home;
     return unless $home;
     return $home->file( 'cfg' );
-}
-
-has cfg => qw/ reader cfg writer _cfg isa HashRef lazy_build 1 /;
-sub _build_cfg {
-    my $self = shift;
-    return $self->load_cfg;
-}
-
-sub read_cfg {
-    my $self = shift;
-    return unless my $cfg_file = $self->cfg_file;
-    return unless -f $cfg_file && -r $cfg_file;
-    return scalar $cfg_file->slurp;
-}
-
-sub load_cfg {
-    my $self = shift;
-    return {} unless defined ( my $cfg_content = $self->read_cfg );
-    my $cfg = YAML::XS::Load( $cfg_content );
-    return $cfg;
-}
-
-sub reload_cfg {
-    my $self = shift;
-    $self->_cfg( $self->load_cfg );
 }
 
 has argument_options => qw/ is ro lazy_build 1 /;
@@ -145,160 +144,613 @@ sub _build_options {
 
     my $cfg = $self->cfg;
     my @options;
-    defined $cfg->{ $_ } && length $cfg->{ $_ } and push @options, $_ => $cfg->{ $_ } for qw/ delay /;
+    defined $cfg->{ $_ } and length $cfg->{ $_ } and push @options, $_ => $cfg->{ $_ } for qw/ delay /;
+    push @options, $_ => $cfg->{ $_ } for qw/ unsafe /;
 
     my %argument_options = %{ $self->argument_options };
 
     return { %default_options, @options, %argument_options };
 }
 
-sub dispatch {
+has stash => qw/ is ro lazy_build 1 /;
+sub _build_stash {
+    return {};
+}
+
+has [qw/ query found /] => qw/ is rw isa ArrayRef /, default => sub { [] };
+
+sub run {
     my $self = shift;
     my @arguments = @_;
 
     my $options = $self->argument_options;
     my ( $help );
-    Getopt::Usaginator->parse( \@arguments,
-        'copy' => \$options->{ copy },
-        'delay=s' => \$options->{ delay },
-        'help|h' => \$help,
-        'cfg|config=s' => \$options->{ cfg },
-        'safety' => \$options->{ safety },
+    Getopt::Usaginator->parse( \@arguments, $options,
+        qw/ delay=s help|h cfg|config=s unsafe /,
     );
+
+    if ( $self->require_passphrase ) {
+        my $passphrase = $self->read_passphrase( 'Passphrase: ' );
+        $self->say_stderr;
+        if ( ! defined $passphrase || ! length $passphrase ) {
+            $self->say_stderr( "# No passphrase entered" );
+            exit 64;
+        }
+        $self->passphrase( $passphrase );
+    }
+
     $options = $self->options;
 
-    if ( ! @arguments ) {
+    $self->dispatch( '?' );
+    $self->dispatch( join( ' ', @arguments ) );
+    $self->dispatch( '' ) if @arguments;
+}
+
+sub _select {
+    my $self = shift;
+
+    my $found = $self->found;
+    my $k = $self->stash->{_}[0];
+    my $n = $k2n{ $k };
+
+    return unless defined $found->[ $n ];
+    my $target = $found->[ $n ];
+    my $entry = $self->store->get( $target );
+    return ( $target, $entry, $k, $n );
+}
+
+my $_show = sub {
+    my ( $self, $method ) = @_;
+
+    return unless my ( $target, $entry, $k, $n ) = $self->_select;
+    $self->emit_entry( $target, $entry );
+    $self->dispatch( '//' );
+};
+
+my $_copy = sub {
+    my ( $self, $method ) = @_;
+
+    return unless my ( $target, $entry, $k, $n ) = $self->_select;
+    $self->emit_entry( $target, $entry, copy => 1 );
+};
+
+sub emit_entry {
+    my $self = shift;
+    my $target = shift;
+    my $entry = shift;
+    my %options = @_;
+
+    $self->say_stdout( sprintf "\n    === %s ===\n\n", $target );
+    if ( $target =~ m/^([^@]+)@/ ) {
+        $self->emit_username_password( $1, $entry, copy => $options{ copy } );
+    }
+    else {
+        $self->emit_secret( $entry, copy => $options{ copy } );
+    }
+}
+
+sub emit_username_password {
+    my $self = shift;
+    my ( $username, $password, %options ) = @_;
+
+    if ( $options{ copy } ) {
+        $self->copy( username => $username );
+        $self->copy( password => $password );
+    }
+    else {
+        $self->safe_stdout( <<_END_ );
+        $username
+        $password
+
+_END_
+    }
+}
+
+sub emit_secret {
+    my $self = shift;
+    my ( $secret, %options ) = @_;
+
+    if ( $options{ copy } ) {
+        $self->copy( secret => $secret );
+    }
+    else {
+        $self->safe_stdout( $secret, "\n" );
+    }
+}
+
+
+our $DISPATCH = Hash::Dispatch->dispatch(
+
+    '' => sub {
+        my ( $self, $method ) = @_;
+
+        while ( 1 ) {
+            $self->stdout( "> " );
+            my $line = $self->stdin_readline;
+            next unless defined $line;
+            next unless length $line;
+            $self->dispatch( $line );
+        }
+
+    },
+
+    '?' => sub {
+        my ( $self, $method ) = @_;
+
         my $cfg_file = $self->cfg_file;
         my $cfg_file_size = -f $cfg_file && -s _;
         defined && length or $_ = '-1' for $cfg_file_size;
-        my ( $reader, $editor ) = map { defined $_ ? $_ : '-' } @{ $self->cfg }{qw/ reader editor /};
+        {
+            my ( $read, $edit, $copy, $paste ) =
+                map { defined $_ ? $_ : '~' } @{ $self->cfg }{qw/ read edit copy paste /};
 
-        $self->stdout( <<_END_ );
+            my $randomart = App::locket::TextRandomart->randomart( sha1_hex $self->plaincfg );
+            my @randomart = split "\n", $randomart;
+            @randomart = map { "    $_  " } @randomart;
+            $randomart[ 1 ] .= "$cfg_file ($cfg_file_size)";
+            $randomart[ 3 ] .= "  $read";
+            $randomart[ 4 ] .= "  $edit";
+            $randomart[ 5 ] .= "  $copy";
+            $randomart[ 6 ] .= "  $paste";
+
+            $randomart = join "\n", @randomart;
+
+            $self->stdout( <<_END_ );
 App::locket @{[ $App::locket::VERSION || '0.0' ]}
 
-    $cfg_file ($cfg_file_size)
-
-      Read cipherstore: $reader
-      Edit cipherstore: $editor
-
+$randomart
 _END_
-    }
-    else {
-
-        usage 0 if $help || $arguments[ 0 ] eq 'help';
-
-        $options->{ delay } ||= 0;
-        if ( $options->{ delay } !~ m/^\d+$/ ) {
-            die "*** Invalid delay value ($options->{ delay })";
+            $self->say_stdout;
         }
 
-        my $_0 = shift @arguments;
-        if ( $_0 eq 'setup' || $_0 eq 'cfg' || $_0 eq 'config' ) {
+        return;
 
-            my $cfg_file = $self->cfg_file;
-            my $cfg_content;
-            $cfg_content = $self->read_cfg if -s $cfg_file;
-            if ( ! defined $cfg_content || $cfg_content !~ m/\S/ ) {
-                $cfg_content = <<_END_;
+        my $stash = $self->stash;
+        my $query = $self->query;
+        if ( @$query ) {
+            $self->say_stdout( sprintf "    /: %s", join '/', @$query );
+        }
+
+        my ( $target, $entry ) = @$stash{qw/ target entry /};
+        if ( defined $target ) {
+            $self->say_stdout( sprintf "    =: %s", $target );
+        }
+
+    },
+
+    'setup' => sub {
+        my ( $self, $method ) = @_;
+
+        my $cfg_file = $self->cfg_file;
+        my $plaincfg = $self->plaincfg;
+        if ( ! defined $plaincfg || $plaincfg !~ m/\S/ ) {
+            $plaincfg = <<_END_;
 %YAML 1.1
 ---
-#reader: '</usr/bin/gpg -d <file>'
-#reader: '</usr/bin/openssl des3 -d -in <file>'
-#editor: '/usr/bin/vim -n <file>'
+#read: '</usr/bin/gpg -d <file>'
+#read: '</usr/bin/openssl des3 -d -in <file>'
+#edit: '/usr/bin/vim -n <file>'
+#copy: -
+#paste: -
 _END_
-            }
-            my $file = File::Temp->new( template => '.locket.cfg.XXXXXXX', dir => '.', unlink => 0 ); # TODO A better dir?
-            my $edit = Term::EditorEdit->edit( file => $file, document => $cfg_content );
-            $cfg_file->parent->mkpath;
-            if ( -s $file->filename ) {
-                rename $file->filename, $cfg_file or die "*** Unable to overwrite $cfg_file: $!";
-            }
         }
-        elsif ( $_0 eq 'edit' ) {
-            my $editor = $self->cfg->{ editor };
-            if ( defined $editor && length $editor ) {
-                system( $editor );
-            }
-            else {
-                $self->stderr( "% Missing (editor) in cfg" );
-            }
+        my $file = File::Temp->new( template => '.locket.cfg.XXXXXXX', dir => '.', unlink => 1 ); # TODO A better dir?
+        my $plaincfg_edit = Term::EditorEdit->edit( file => $file, document => $plaincfg );
+        if ( length $plaincfg_edit ) {
+            $self->write_cfg( $plaincfg_edit );
         }
-        elsif ( $_0 eq 'read' ) {
-            if ( $self->check_read ) {
-                my $plainstore = $self->read;
-                $self->safe_stdout( $plainstore );
-            }
+    },
+
+    'cfg' => 'setup',
+    'config' => 'setup',
+
+    qr/^q(?:u(?:i?)?)?$/ => 'quit',
+    'quit' => sub {
+        my ( $self, $method ) = @_;
+        exit 0;
+    },
+
+    qr/^h(?:e(?:l?)?)?$/ => 'help',
+    'help' => sub {
+        my ( $self, $method ) = @_;
+
+        my $edit = $self->cfg->{ edit };
+        my $read = $self->cfg->{ read };
+        my $cfg_file = $self->locket->cfg_file;
+
+        $self->stdout( <<_END_ );
+    
+    /<query>            Search the store for <query> and emit the
+                        resulting secret
+
+                        Alternatively, append a term to the last query
+                        and re-search
+
+    .                   Redisplay the results of the last query
+
+    ..                  Pop the last term off the last query (if any) 
+                        and re-search
+
+    //<query>           Search the store for <query>, ignoring
+                        any previous query
+
+    list                List all the entries in the store
+
+    edit                Edit the store (via $edit)
+
+    read                Emit the plainstore (via $read)
+
+    cfg                 Configure locket ($cfg_file)
+
+    reset               Clear the screen and wipe the last query/
+                        current search
+
+_END_
+    },
+
+    'lock' => sub {
+        my ( $self, $method ) = @_;
+
+        my $passphrase = $self->read_passphrase( 'Passphrase: ' );
+        $self->say_stderr;
+        if ( ! defined $passphrase || ! length $passphrase ) {
+            $self->say_stderr( "# No passphrase entered" );
         }
         else {
-            if ( $self->check_read ) {
-                my $plainstore = $self->read;
-                my $store;
-                try {
-                    if ( $plainstore =~ m/^\s*\{/ )
-                            { $store = $JSON->decode( $plainstore ) }
-                    else    { $store = YAML::XS::Load( $plainstore ) }
-                };
-                die sprintf "*** Unable to parse store (%d)", length $plainstore if !$store;
+            $self->passphrase( $passphrase );
+            $self->write_cfg( $self->plaincfg );
+        }
+    },
 
-                my $target = $_0;
-                $target =~ s/^\///;
-                my @found = ( $store->{ $target } );
+    'unlock' => sub {
+        my ( $self, $method ) = @_;
 
-                if ( !length $target ) {
-                    @found = sort keys %$store;
-                }
-                elsif ( defined $store->{ $target } ) {
-                    @found = ( $target );
-                }
-                else {
-                    @found = sort grep { m/\Q$target\E/ } keys %$store;
-                }
+        $self->passphrase( undef );
+        $self->write_cfg( $self->plaincfg );
+    },
 
-                if ( 1 == @found ) {
-                    my $found = $found[0];
-                    my $secret = $store->{ $found };
-                    if ( $found =~ m/^([^@]+)@/ ) {
-                        $self->emit_username_password( $1, $secret );
-                    }
-                    else {
-                        $self->emit_secret( $secret );
-                    }
+    qr/^e(?:d(?:i?)?)?$/ => 'edit',
+    'edit' => sub {
+        my ( $self, $method ) = @_;
+
+        my $edit = $self->cfg->{ edit };
+        if ( defined $edit && length $edit ) {
+            system( $edit );
+        }
+        else {
+            $self->say_stderr( "% Missing (edit) in cfg" );
+        }
+    },
+
+    qr/^r(?:e(?:a?)?)?$/ => 'read',
+    'read' => sub {
+        my ( $self, $method ) = @_;
+        return unless $self->check_read;
+
+        my $plainstore = $self->read;
+        $self->safe_stdout( $plainstore );
+    },
+
+
+    qr/^l(?:i(?:s?)?)?$/ => 'list',
+    'list' => sub {
+        my ( $self, $method ) = @_;
+        return unless $self->check_read;
+
+        my @keys = $self->store->all;
+
+        $self->do_pager( sub {
+            my $fh = shift;
+            $fh->print( "\n" );
+            $fh->print( sprintf "# Total: %d\n", scalar @keys );
+            $fh->print( "\n" );
+            $fh->print( join "\n", ( map { "   $_" } @keys ), '' );
+            $fh->print( "\n" );
+        }, clear => 1 );
+    },
+
+    qr/^(\/+|\.\.|\.)(.*)/ => sub {
+        my ( $self, $method ) = @_;
+
+        my $store = $self->store;
+        my $last_query = $self->query;
+        my $last_found = $self->found;
+
+        my $stash = $self->stash;
+        my $dotted = $stash->{_}[0] eq '.';
+        my $dotdotted = $stash->{_}[0] eq '..';
+
+        my ( @query, @result_query, @result_found );
+        @query = @$last_query;
+
+        if ( $dotdotted ) {
+            pop @query;
+        }
+        if ( $dotted ) {
+            @result_query = @$last_query;
+            @result_found = @$last_found;
+        }
+        else {
+            my $slashes = length( $stash->{_}[0] ) || 0;
+            my $target = $stash->{_}[1];
+
+            if ( !$dotdotted && 2 == $slashes ) {
+                undef @query;
+            }
+
+            $target = trim $target;
+            if ( length $target ) {
+                # Last search was a dud, so we'll pop the last term
+                pop @query unless @$last_found;
+                push @query, $target;
+            }
+
+            my $result = $self->store->search( \@query );
+            @result_query = @{ $result->{ query } };
+            @result_found = @{ $result->{ found } };
+
+            $self->query( \@result_query );
+            $self->found( \@result_found );
+        }
+
+        my $total = @result_found;
+        my ( @visible, @invisible );
+        @visible = @result_found;
+        if ( @visible > 10 ) {
+            @invisible = splice @visible, 10;
+        }
+
+        $self->stdout_clear;
+        $self->dispatch( '?' );
+        if ( @query != @result_query ) {
+            $self->say_stdout( sprintf "# Query: %s (%s)", join( '/', @result_query ), join( '/', @query ) );
+        }
+        elsif ( @query ) {
+            $self->say_stdout( sprintf "# Query: %s", join '/', @query );
+        }
+        else {
+            $self->say_stdout( sprintf "# Query: %s", '<nil>' );
+        }
+
+        $self->say_stdout;
+        if ( @visible ) {
+            my $n = 0;
+            $self->say_stdout( "    $n2k{$n++}. $_" ) for @visible;
+            $self->say_stdout;
+        }
+
+        if ( @invisible ) {
+            $self->say_stdout( sprintf "# Showing %d out of %d", scalar @visible, $total ); 
+            $self->say_stdout( "# Refine your search: /<query>" );
+        }
+        else {
+            $self->say_stdout( sprintf "# Found %d", $total );
+        }
+        $self->say_stdout( "# Redo your search: //<query>" );
+        #$self->say_stdout( sprintf "# Select an entry: [%s]", join '', map { $n2k{$_} } 0 .. @visible - 1 );
+        #$self->say_stdout( sprintf "# Show an entry: show <entry>" );
+        if ( @visible ) {
+            $self->say_stdout( sprintf "# Show an entry: show [%s]", join '', map { $n2k{$_} } 0 .. @visible - 1 );
+            $self->say_stdout( sprintf "# Copy the an entry to the clipboard: copy <entry>" );
+        }
+        else {
+            $self->say_stdout( sprintf "# Show list: list" );
+        }
+
+        $self->say_stdout;
+    },
+
+    qr/^s(?:h(?:o(?:w)?)?)?\s*(\d+)/ => $_show,
+
+    qr/^c(?:o(?:p(?:y)?)?)?\s*(\d+)/ => $_copy,
+
+    qr/^cp\s*(\d+)/ => $_copy,
+
+    reset => sub {
+        my ( $self, $method ) = @_;
+        $self->query( [] );
+        $self->found( [] );
+        delete @{ $self->stash }{qw/ target entry /};
+        $self->stdout_clear;
+        $self->dispatch( '?' );
+    },
+
+    qr/^([0-9])$/ => sub {
+        my ( $self, $method ) = @_;
+
+        return unless my ( $target, $entry, $k, $n ) = $self->_select;
+        my $stash = $self->stash;
+        @$stash{qw/ target entry /} = ( $target, $entry );
+
+        my $query = $self->query;
+
+        $self->stdout_clear;
+        $self->dispatch( '?' );
+        $self->say_stdout( sprintf "    === %s ===\n\n", $target );
+        $self->say_stdout( "# Show entry ($target): show" );
+        $self->say_stdout( "# Copy the entry into the clipboard: copy" );
+        $self->say_stdout( sprintf "# Show last search: / (%s)", join '/', @$query ) if @$query;
+        $self->say_stdout;
+    },
+
+    qr/^s(?:h(?:o?)?)?$/ => 'show',
+    show => sub {
+   
+        my ( $self, $method ) = @_;
+
+        my $stash = $self->stash;
+        return unless my ( $target, $entry ) = @$stash{qw/ target entry /};
+        $self->emit_entry( $target, $entry );
+        $self->dispatch( '.' );
+    },
+
+    qr/^c(?:o(?:p)?)?$|cp$/ => 'copy',
+    copy => sub {
+        my ( $self, $method ) = @_;
+
+        my $stash = $self->stash;
+        return unless my ( $target, $entry ) = @$stash{qw/ target entry /};
+        $self->emit_entry( $target, $entry, copy => 1 );
+    },
+
+);
+
+sub dispatch {
+    my $self = shift;
+    my $method = shift;
+
+    defined or $_ = '' for $method;
+
+    my $result = $DISPATCH->dispatch( $method );
+
+    if ( ! $result ) {
+        $self->say_stdout( "# ><" );
+        return;
+    }
+
+    $self->stash->{_} = [ $result->captured ];
+    return $result->value->( $self, $method );
+}
+
+sub stdout {
+    my $self = shift;
+    my $fh = \*STDOUT if 1;
+    $fh->print(  join '', @_ ) if @_;
+    return $fh;
+}
+
+sub say_stdout {
+    my $self = shift;
+    my $emit = join '', @_;
+    chomp $emit;
+    $self->stdout( $emit, "\n" );
+}
+
+sub safe_stdout {
+    my $self = shift;
+    if ( $self->options->{ unsafe } ) {
+    }
+    else {
+        $self->say_stderr( "# Press RETURN to emit plaintext" );
+        $self->stdin_readreturn;
+    }
+    $self->stdout_clear;
+    $self->stdout( "\n", @_ );
+    $self->say_stderr( "# Press RETURN to clear the screen and continue" );
+    $self->stdin_readreturn;
+    $self->stdout_clear;
+}
+
+sub stdout_clear {
+    my $self = shift;
+    $self->stdout( "\x1b[2J\x1b[H" );
+}
+
+sub stderr {
+    my $self = shift;
+    my $fh = \*STDERR if 1;
+    $fh->print(  join '', @_ ) if @_;
+    return $fh;
+}
+
+sub say_stderr {
+    my $self = shift;
+    my $emit = join '', @_;
+    chomp $emit;
+    $self->stderr( $emit, "\n" );
+}
+
+sub stdin {
+    return \*STDIN;
+}
+
+sub read_passphrase {
+    my $self = shift;
+    my $prompt = shift;
+    if ( defined $prompt ) {
+        $self->stderr( $prompt );
+    }
+
+    my $passphrase;
+    ReadMode 2;
+    try {
+        $passphrase = $self->stdin->getline;
+        chomp $passphrase;
+    }
+    finally {
+        ReadMode 0;
+    };
+
+    return $passphrase;
+}
+
+sub stdin_readline {
+    my $self = shift;
+
+    my $input = "";
+
+    try {
+        ReadMode 3;
+        my $escape = 0;
+        my $chr;
+        while ( defined ( $chr = ReadKey ) ) {
+            if ( $escape ) {
+                $escape--;
+                next;
+            }
+            my $ord = ord $chr;
+            if ( $ord >= 32 && $ord < 127 ) {
+                print $chr;
+                $input .= $chr;
+            }
+            elsif ( $ord == 27 ) {
+                $escape = 2;
+            }
+            elsif ( $ord == 13 || $ord == 10 ) {
+                print "\n";
+                last;
+            }
+            else {
+                if ( $ord == 8 || $ord == 127 ) {
+                    $input = substr $input, 0, -1 + length $input;
+                    print "\b \b";
                 }
-                elsif ( 0 == @found ) {
-                    $self->stdout( "# No matches for \"$target\"" );
-                }
-                else {
-                    $self->stdout( "# Found for \"$target\":" ) if length $target;
-                    $self->stdout( "    $_" ) for @found;
+                elsif ( $ord == 21 ) {
+                    print "\r", (" " x ( 2 * length $input ) ), "\r";
+                    print "> ";
+                    $input = "";
                 }
             }
         }
     }
+    catch {
+        print "\n";
+    }
+    finally {
+        ReadMode 0;
+    };
+
+    return $input;
 }
 
 sub check_read {
     my $self = shift;
-    local $_ = $self->cfg->{ reader };
-    return 1 if defined and m/\S/;
-    $self->stderr( "% Missing (reader) in cfg" );
+    return 1 if $self->can_read;
+    $self->say_stderr( "% Missing (read) in cfg" );
     return 0;
 }
 
-sub read {
+sub stdin_readreturn {
     my $self = shift;
-
-    my $reader = $self->cfg->{ reader };
-    $reader = '' unless defined $reader;
-    if ( $reader =~ m/^\s*[|<]/ ) {
-        ( my $pipe = $reader ) =~ s/^\s*[|<]//;
-        open my $cipher, '-|', $pipe;
-        my $plainstore = join '', <$cipher>;
-        chomp $plainstore;
-        return "$plainstore\n";
+    my $delay = shift;
+    ReadMode 2; # Disable keypress echo
+    while ( 1 ) {
+        my $continue = ReadKey $delay;
+        last unless defined $continue;
+        chomp $continue;
+        last unless length $continue;
     }
-    else {
-        die "*** Unknown/invalid reader ($reader)";
-    }
+    ReadMode 0;
 }
 
 sub copy {
@@ -306,43 +758,103 @@ sub copy {
     my $name = shift;
     my $value = shift;
 
-    my $SIG_INT = $SIG{ INT } || sub { exit 0 };
+    my $SIG_INT = $SIG{ INT } || sub { exit 1 };
     local $SIG{ INT } = sub {
-        $self->_copy( '' );
+        $self->do_copy( '' );
         ReadMode 0;
         $SIG_INT->();
     };
 
     my $delay = $self->options->{ delay };
     if ( $delay ) {
-        $self->stdout( sprintf "# Copied ($name) into clipboard with %d:%02d delay", int( $delay / 60 ), $delay % 60 );
+        $self->say_stdout( sprintf "# Press RETURN to copy {$name} into clipboard with %d:%02d delay", int( $delay / 60 ), $delay % 60 );
     }
     else {
-        $self->stdout( "# Copied ($name) into clipboard for NO delay" );
+        $self->say_stdout( "# Press RETURN to copy {$name} into clipboard for NO delay" );
     }
-    $self->stdout( "# Press ENTER to continue (clipboard will be wiped)" );
-    $self->_copy( $value );
-    ReadMode 2; # Disable keypress echo
-    while ( 1 ) {
-        my $continue = ReadKey $delay;
-        chomp $continue;
-        last unless length $continue;
-    }
-    ReadMode 0;
-    my $paste = $self->_paste;
+    $self->stdin_readreturn;
+    $self->do_copy( $value );
+    $self->say_stdout( "# Copied -- Press RETURN again to wipe clipboard and continue" );
+    $self->stdin_readreturn( $delay );
+    $self->say_stdout;
+    my $paste = $self->do_paste;
     if ( ! defined $paste || $paste eq $value ) {
         # To be safe, we wipe out the clipboard in the case where
         # we were unable to get a read on the clipboard (pbpaste, xsel, or
         # xclip failed)
-        $self->_copy( '' ); # Wipe out clipboard
+        $self->do_copy( '' ); # Wipe out clipboard
     }
 }
 
-sub _find_cmd {
+sub editor_prgm {
+    my $self = shift;
+
+    my $found = $self->cfg->{ editor };
+    defined and return $_ for $found;
+
+    $found = $self->_find_prgm( 'sensible-editor' );
+    defined and return $_ for $found;
+
+    $found = $ENV{ VISUAL };
+    defined and return $_ for $found;
+
+    $found = $ENV{ EDITOR };
+    defined and return $_ for $found;
+
+    return;
+}
+
+sub do_pager {
+    my $self = shift;
+    my $content = shift;
+    my %options = @_;
+
+    my $prgm = $self->pager_prgm;
+
+    if ( ! defined $prgm ) {
+        $self->say_stderr( "% Missing (pager) in cfg/\$PAGER" );
+        return;
+    }
+
+    if ( $options{ clear } ) {
+        $self->stdout_clear;
+    }
+
+    open my $fh, '|-', $prgm;
+    if ( ref $content eq 'CODE' ) {
+        $content->( $fh );
+    }
+    else {
+        $fh->print( $content );
+    }
+    close $fh;
+
+    return 1;
+}
+
+sub pager_prgm {
+    my $self = shift;
+
+    my $found = $self->cfg->{ pager };
+    defined and return $_ for $found;
+
+    $found = $self->_find_prgm( 'sensible-pager' );
+    defined and return $_ for $found;
+
+    $found = $ENV{ PAGER };
+    defined and return $_ for $found;
+
+    $found = $self->_find_prgm( 'less' );
+    defined and return $_ for $found;
+
+    return;
+}
+
+sub _find_prgm {
     my $self = shift;
     my $name = shift;
 
-    for (qw{ /bin /usr/bin /usr/local/bin }) {
+    for (qw{ /bin /usr/bin }) {
         my $cmd = file split( '/', $_ ), $name;
         return $cmd if -f $cmd && -x $cmd;
     }
@@ -350,17 +862,38 @@ sub _find_cmd {
     return undef;
 }
 
-sub _copy {
+sub do_copy {
     my $self = shift;
     my $value = shift;
 
+    my $copy = $self->cfg->{ copy };
+    if ( defined $copy ) {
+        $self->_pipe_into( $copy => $value );
+        return 1;
+    }
+
     if ( lc $^O eq 'darwin' ) {
-        return $self->_try_pbcopy( $value );
+        return 1 if $self->_try_copy( 'pbcopy', $value );
     }
-    else {
-        return 1 if $self->_try_xsel_copy( $value );
-        return $self->_try_xclip_copy( $value );
+
+    return 1 if $self->_try_copy( 'xsel', $value );
+    return 1 if $self->_try_copy( 'xclip', $value );
+    return;
+}
+
+sub _try_copy {
+    my $self = shift;
+    my $name = shift;
+    my $value = shift;
+
+    my $execute = $App::locket::Util::COPY{ $name };
+    if ( ! $execute ) {
+        warn "*** Missing (copy) CODE for $name";
+        return;
     }
+    return unless my $prgm = $self->_find_prgm( $name );
+    $execute->( $self, $prgm, $value );
+    return 1;
 }
 
 sub _pipe_into {
@@ -373,45 +906,41 @@ sub _pipe_into {
     close $pipe;
 }
 
-sub _try_pbcopy {
-    my $self = shift;
-    my $value = shift;
-
-    return unless my $pbcopy = $self->_find_cmd( 'pbcopy' );
-    $self->_pipe_into( $pbcopy => $value );
-    return 1;
-}
-
-sub _try_xsel_copy {
-    my $self = shift;
-    my $value = shift;
-
-    return unless my $xsel = $self->_find_cmd( 'xsel' );
-    $self->_pipe_into( $xsel => $value );
-    return 1;
-}
-
-sub _try_xclip_copy {
-    my $self = shift;
-    my $value = shift;
-
-    return unless my $xclip = $self->_find_cmd( 'xclip' );
-    $self->_pipe_into( "$xclip -i" => $value );
-    return 1;
-}
-
-sub _paste {
+sub do_paste {
     my $self = shift;
 
+    my $paste = $self->cfg->{ paste };
+    if ( defined $paste ) {
+        return $self->_pipe_outfrom( $paste );
+    }
+
+    my $value;
     if ( lc $^O eq 'darwin' ) {
-        return $self->_try_pbpaste;
-    }
-    else {
-        my $value;
-        $value = $self->_try_xsel_paste( $value );
+        $value = $self->_try_paste( 'pbpaste' );
         return $value if defined $value;
-        return $self->_try_xclip_paste( $value );
     }
+
+    $value = $self->_try_paste( 'xsel' );
+    return $value if defined $value;
+
+    $value = $self->_try_paste( 'xclip' );
+    return $value if defined $value;
+
+    return;
+}
+
+sub _try_paste {
+    my $self = shift;
+    my $name = shift;
+    my $value = shift;
+
+    my $execute = $App::locket::Util::PASTE{ $name };
+    if ( ! $execute ) {
+        warn "*** Missing (paste) CODE for $name";
+        return;
+    }
+    return unless my $prgm = $self->_find_prgm( $name );
+    return $execute->( $self, $prgm );
 }
 
 sub _pipe_outfrom {
@@ -421,86 +950,6 @@ sub _pipe_outfrom {
 
     open my $pipe, '-|', $cmd or die $!;
     return join '', <$pipe>;
-}
-
-sub _try_pbpaste {
-    my $self = shift;
-    my $value = shift;
-
-    return unless my $pbpaste = $self->_find_cmd( 'pbpaste' );
-    return $self->_pipe_outfrom( $pbpaste );
-}
-
-sub _try_xsel_paste {
-    my $self = shift;
-
-    return unless my $xsel = $self->_find_cmd( 'xsel' );
-    return $self->_pipe_outfrom( $xsel );
-}
-
-sub _try_xclip_paste {
-    my $self = shift;
-    my $value = shift;
-
-    return unless my $xclip = $self->_find_cmd( 'xclip' );
-    return $self->_pipe_outfrom( $xclip );
-}
-
-sub emit_username_password {
-    my $self = shift;
-    my ( $username, $password ) = @_;
-
-    if ( $self->options->{ copy } ) {
-        $self->copy( username => $username );
-        $self->copy( password => $password );
-    }
-    else {
-        $self->safe_stdout( <<_END_ );
-$username
-$password
-_END_
-    }
-}
-
-sub emit_secret {
-    my $self = shift;
-    my ( $secret ) = @_;
-
-    if ( $self->options->{ copy } ) {
-        $self->copy( secret => $secret );
-    }
-    else {
-        $self->safe_stdout( $secret, "\n" );
-    }
-}
-
-sub stdout {
-    my $self = shift;
-    my $emit = join '', @_;
-    chomp $emit;
-    print STDOUT $emit, "\n";
-}
-
-sub safe_stdout {
-    my $self = shift;
-    if ( $self->options->{ safety } ) {
-        $self->stdout( "# Press ENTER to continue (emitting plaintext)" );
-        ReadMode 2; # Disable keypress echo
-        while ( 1 ) {
-            my $continue = ReadKey 0;
-            chomp $continue;
-            last unless length $continue;
-        }
-        ReadMode 0;
-    }
-    $self->stdout( @_ );
-}
-
-sub stderr {
-    my $self = shift;
-    my $emit = join '', @_;
-    chomp $emit;
-    print STDERR $emit, "\n";
 }
 
 1;
@@ -515,7 +964,7 @@ App::locket - Copy secrets from a YAML/JSON cipherstore into the clipboard (pbco
 
 =head1 VERSION
 
-version 0.0014
+version 0.0020
 
 =head1 SYNOPSIS
 
@@ -531,10 +980,6 @@ version 0.0014
 
     # Show a secret from the cipherstore:
     $ locket /alice@gmail
-
-    # Copy an entry from the cipherstore into the clipboard:
-    # (The clipboard will be purged after 10 seconds)
-    $ locket --copy --delay 10 /alice@gmail
 
 =head1 DESCRIPTION
 
@@ -567,14 +1012,12 @@ App::locket does not perform any in-memory encryption; once the cipherstore is l
 
 In addition, if the process is swapped out while running then the plaintextstore could be written to disk
 
-Encrypting swap is one way of mitigating this problem (secure virtual memory)
+Encrypting swap is one way of mitigating this problem
 
 =head2 Clipboard access
 
 App::locket uses third-party tools for read/write access to the clipboard. It tries to detect if
-pbcopy, xsel, or xclip are available. It does this by looking in /bin, /usr/bin, and /usr/local/bin (in that order)
-
-It will NOT search $PATH
+C<pbcopy>, C<xsel>, or C<xclip> are available. It does this by looking in C</bin> and C</usr/bin>
 
 =head2 Purging the clipboard
 
@@ -590,6 +1033,12 @@ If you prematurely cancel a secret copying operation via CTRL-C, App::locket wil
 Currently, App::locket does not encrypt/protect the configuration file. This means an attacker can potentially (unknown to you) modify
 the reading/editing commands to divert the plaintext elsewhere
 
+There is an option to lock the configuration file, but given the ease of code injection you're probably better off installing and using App::locket in a dedicated VM
+
+=head2 Resetting $PATH
+
+C<$PATH> is reset to C</bin:/usr/bin>
+
 =head1 INSTALL
 
     $ cpanm -i App::locket
@@ -602,12 +1051,15 @@ L<http://search.cpan.org/perldoc?App::cpanminus#INSTALLATION>
 
     locket [options] setup|edit|<query>
 
-        --copy              Copy value to clipboard using pbcopy, xsel, or xclip
-
         --delay <delay>     Keep value in clipboard for <delay> seconds
                             If value is still in the clipboard at the end of
                             <delay> then it will be automatically wiped from
                             the clipboard
+
+        --unsafe            Turn the safety off. This will disable prompting
+                            before emitting any sensitive information in
+                            plaintext. There will be no opportunity to
+                            abort (via CTRL-C)
 
         setup               Setup a new or edit an existing user configuration
                             file (~/.locket/cfg)
@@ -618,7 +1070,7 @@ L<http://search.cpan.org/perldoc?App::cpanminus#INSTALLATION>
                                 /usr/bin/vim -n ~/.locket.gpg
 
 
-        <query>             Search the cipherstore for <query> and emit the
+        /<query>            Search the cipherstore for <query> and emit the
                             resulting secret
                             
                             The configuration must have a "reader" value to
@@ -631,6 +1083,8 @@ L<http://search.cpan.org/perldoc?App::cpanminus#INSTALLATION>
                             If the found key in the cipherstore is of the format
                             "<username>@<site>" then the username will be emitted
                             first before the secret (which is assumed to be a password/passphrase)
+
+        Type <help> in-process for additional usage
 
 =head1 Example YAML cipherstore
 

@@ -5,9 +5,9 @@ author:
 build_requires:
   Test::Most: 0
 configure_requires:
-  ExtUtils::MakeMaker: 6.31
+  ExtUtils::MakeMaker: 6.30
 dynamic_config: 0
-generated_by: 'Dist::Zilla version 4.102345, CPAN::Meta::Converter version 2.110930'
+generated_by: 'Dist::Zilla version 4.200008, CPAN::Meta::Converter version 2.110930'
 license: perl
 meta-spec:
   url: http://module-build.sourceforge.net/META-spec-v1.4.html
@@ -15,13 +15,18 @@ meta-spec:
 name: App-locket
 requires:
   Any::Moose: 0
+  Crypt::Random: 0
+  Crypt::Rijndael: 0
+  Digest::SHA: 0
   File::HomeDir: 0
   Getopt::Usaginator: 0
+  Hash::Dispatch: 0
   JSON: 0
+  MIME::Base64: 0
   Path::Class: 0
   String::Util: 0
   Term::EditorEdit: 0
   Term::ReadKey: 0
   Try::Tiny: 0
   YAML::XS: 0
-version: 0.0014
+version: 0.0020

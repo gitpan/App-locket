@@ -4,4 +4,4 @@ use strict;
 use warnings;
 
 use App::locket;
-App::locket->new->dispatch( @ARGV );
+App::locket->new->run( @ARGV );
