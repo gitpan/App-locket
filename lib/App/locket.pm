@@ -1,6 +1,6 @@
 package App::locket;
 BEGIN {
-  $App::locket::VERSION = '0.0020';
+  $App::locket::VERSION = '0.0021';
 }
 # ABSTRACT: Copy secrets from a YAML/JSON cipherstore into the clipboard (pbcopy, xsel, xclip)
 
@@ -103,7 +103,7 @@ my %default_options = (
 
 has locket => qw/ reader locket writer _locket isa App::locket::Locket lazy_build 1 /, handles =>
     [qw/
-        cfg plaincfg write_cfg can_read read passphrase require_passphrase
+        cfg plaincfg write_cfg reload_cfg can_read read passphrase require_passphrase
         store
     /];
 sub _build_locket {
@@ -220,7 +220,7 @@ sub emit_entry {
     my $entry = shift;
     my %options = @_;
 
-    $self->say_stdout( sprintf "\n    === %s ===\n\n", $target );
+    $self->say_stdout( sprintf "\n    === %s ===\n", $target );
     if ( $target =~ m/^([^@]+)@/ ) {
         $self->emit_username_password( $1, $entry, copy => $options{ copy } );
     }
@@ -241,7 +241,6 @@ sub emit_username_password {
         $self->safe_stdout( <<_END_ );
         $username
         $password
-
 _END_
     }
 }
@@ -323,7 +322,7 @@ _END_
 
         my $cfg_file = $self->cfg_file;
         my $plaincfg = $self->plaincfg;
-        if ( ! defined $plaincfg || $plaincfg !~ m/\S/ ) {
+        if ( ! defined $plaincfg || $plaincfg =~ m/^\S*$/ ) {
             $plaincfg = <<_END_;
 %YAML 1.1
 ---
@@ -338,6 +337,12 @@ _END_
         my $plaincfg_edit = Term::EditorEdit->edit( file => $file, document => $plaincfg );
         if ( length $plaincfg_edit ) {
             $self->write_cfg( $plaincfg_edit );
+            $self->stdout_clear;
+            $self->say_stdout( "# Reloading cfg\n---\n" );
+            $self->reload_cfg;
+            $self->dispatch( '?' );
+        }
+        else {
         }
     },
 
@@ -378,12 +383,15 @@ _END_
 
     edit                Edit the store (via $edit)
 
-    read                Emit the plainstore (via $read)
+    read                Show the plainstore through \$PAGER/sensible-pager (via $read)
 
     cfg                 Configure locket ($cfg_file)
 
-    reset               Clear the screen and wipe the last query/
+    reset/clear         Clear the screen and wipe the last query/
                         current search
+
+    reload              Reload the configuration file and
+                        the store (the secret database)
 
 _END_
     },
@@ -416,6 +424,12 @@ _END_
         my $edit = $self->cfg->{ edit };
         if ( defined $edit && length $edit ) {
             system( $edit );
+            # TODO If error...
+            $self->stdout_clear;
+            $self->say_stdout( "# Reloading\n---\n" );
+            $self->locket->reload;
+            $self->dispatch( '?' );
+
         }
         else {
             $self->say_stderr( "% Missing (edit) in cfg" );
@@ -428,7 +442,11 @@ _END_
         return unless $self->check_read;
 
         my $plainstore = $self->read;
-        $self->safe_stdout( $plainstore );
+        $self->safe_pager( sub {
+            my $fh = shift;
+            $fh->print( $plainstore );
+        }, clear => 1 );
+        $self->dispatch( '?' );
     },
 
 
@@ -555,6 +573,14 @@ _END_
         $self->dispatch( '?' );
     },
 
+    clear => 'reset',
+
+    reload => sub {
+        my ( $self, $method ) = @_;
+        $self->reload_cfg;
+        $self->dispatch( '?' );
+    },
+
     qr/^([0-9])$/ => sub {
         my ( $self, $method ) = @_;
 
@@ -579,7 +605,8 @@ _END_
         my ( $self, $method ) = @_;
 
         my $stash = $self->stash;
-        return unless my ( $target, $entry ) = @$stash{qw/ target entry /};
+        my ( $target, $entry ) = @$stash{qw/ target entry /};
+        return unless defined $target;
         $self->emit_entry( $target, $entry );
         $self->dispatch( '.' );
     },
@@ -589,7 +616,8 @@ _END_
         my ( $self, $method ) = @_;
 
         my $stash = $self->stash;
-        return unless my ( $target, $entry ) = @$stash{qw/ target entry /};
+        my ( $target, $entry ) = @$stash{qw/ target entry /};
+        return unless defined $target;
         $self->emit_entry( $target, $entry, copy => 1 );
     },
 
@@ -603,10 +631,7 @@ sub dispatch {
 
     my $result = $DISPATCH->dispatch( $method );
 
-    if ( ! $result ) {
-        $self->say_stdout( "# ><" );
-        return;
-    }
+    return unless $result;
 
     $self->stash->{_} = [ $result->captured ];
     return $result->value->( $self, $method );
@@ -626,17 +651,29 @@ sub say_stdout {
     $self->stdout( $emit, "\n" );
 }
 
+sub safe_pager {
+    my $self = shift;
+    if ( $self->options->{ unsafe } ) {
+    }
+    else {
+        $self->stderr( "\n# Press RETURN to show the plaintext" );
+        $self->stdin_readreturn;
+    }
+    $self->do_pager( @_ );
+    $self->stdout_clear;
+}
+
 sub safe_stdout {
     my $self = shift;
     if ( $self->options->{ unsafe } ) {
     }
     else {
-        $self->say_stderr( "# Press RETURN to emit plaintext" );
+        $self->stderr( "\n# Press RETURN to show the plaintext" );
         $self->stdin_readreturn;
     }
     $self->stdout_clear;
     $self->stdout( "\n", @_ );
-    $self->say_stderr( "# Press RETURN to clear the screen and continue" );
+    $self->stderr( "\n# Press RETURN to clear the screen and continue" );
     $self->stdin_readreturn;
     $self->stdout_clear;
 }
@@ -712,8 +749,10 @@ sub stdin_readline {
             }
             else {
                 if ( $ord == 8 || $ord == 127 ) {
-                    $input = substr $input, 0, -1 + length $input;
-                    print "\b \b";
+                    if ( length $input ) {
+                        $input = substr $input, 0, -1 + length $input;
+                        print "\b \b";
+                    }
                 }
                 elsif ( $ord == 21 ) {
                     print "\r", (" " x ( 2 * length $input ) ), "\r";
@@ -964,7 +1003,7 @@ App::locket - Copy secrets from a YAML/JSON cipherstore into the clipboard (pbco
 
 =head1 VERSION
 
-version 0.0020
+version 0.0021
 
 =head1 SYNOPSIS
 

@@ -3,7 +3,7 @@ NAME
     clipboard (pbcopy, xsel, xclip)
 
 VERSION
-    version 0.0020
+    version 0.0021
 
 SYNOPSIS
         # Setup the configuration file for the cipherstore:

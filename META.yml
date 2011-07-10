@@ -29,4 +29,4 @@ requires:
   Term::ReadKey: 0
   Try::Tiny: 0
   YAML::XS: 0
-version: 0.0020
+version: 0.0021

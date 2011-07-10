@@ -22,24 +22,6 @@ use App::locket::Moose;
 
 has_file cfg_file => qw/ is ro required 1 /;
 
-has cfg => qw/ reader cfg writer _cfg isa HashRef lazy_build 1 /;
-sub _build_cfg {
-    my $self = shift;
-    return $self->load_cfg;
-}
-
-has plainstore => qw/ reader plainstore writer _plainstore isa Str lazy_build 1 /;
-sub _build_plainstore {
-    my $self = shift;
-    return $self->read;
-}
-
-has store => qw/ is ro isa App::locket::Store lazy_build 1 /;
-sub _build_store {
-    my $self = shift;
-    return $self->load;
-}
-
 sub open {
     my $self = shift;
     my $file = shift;
@@ -55,13 +37,19 @@ sub require_passphrase {
     return $ciphercfg =~ m/^\s*\{/;
 }
 
-has ciphercfg => qw/ is ro isa Str lazy_build 1 /;
+has cfg => qw/ is ro isa HashRef lazy_build 1 clearer clear_cfg /;
+sub _build_cfg {
+    my $self = shift;
+    return $self->load_cfg;
+}
+
+has ciphercfg => qw/ is ro isa Str lazy_build 1 clearer clear_ciphercfg/;
 sub _build_ciphercfg {
     my $self = shift;
     return $self->read_cfg;
 }
 
-has plaincfg => qw/ is ro isa Maybe[Str] lazy_build 1 /;
+has plaincfg => qw/ is ro isa Maybe[Str] lazy_build 1 clearer clear_plaincfg /;
 sub _build_plaincfg {
     my $self = shift;
     my $ciphercfg = $self->read_cfg;
@@ -72,6 +60,18 @@ sub _build_plaincfg {
     else {
         return $ciphercfg; # Actually not a "ciphercfg"
     }
+}
+
+has plainstore => qw/ is ro isa Str lazy_build 1 clearer clear_plainstore /;
+sub _build_plainstore {
+    my $self = shift;
+    return $self->read;
+}
+
+has store => qw/ is ro isa App::locket::Store lazy_build 1 clearer clear_store /;
+sub _build_store {
+    my $self = shift;
+    return $self->load;
 }
 
 sub read_cfg {
@@ -129,7 +129,11 @@ sub resolve_cfg_property {
 
 sub reload_cfg {
     my $self = shift;
-    $self->_cfg( $self->load_cfg );
+    $self->clear_ciphercfg;
+    $self->clear_plaincfg;
+    $self->clear_cfg;
+    $self->cfg;
+    $self->reload;
 }
 
 sub can_read {
@@ -166,6 +170,13 @@ sub load {
     };
     die sprintf "*** Unable to parse store (%d)", length $plainstore if !$store;
     return App::locket::Store->new( store => $store );
+}
+
+sub reload {
+    my $self = shift;
+    $self->clear_plainstore;
+    $self->clear_store;
+    $self->store;
 }
 
 # ~
