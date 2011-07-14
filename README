@@ -3,7 +3,7 @@ NAME
     clipboard (pbcopy, xsel, xclip)
 
 VERSION
-    version 0.0021
+    version 0.0022
 
 SYNOPSIS
         # Setup the configuration file for the cipherstore:
@@ -105,7 +105,7 @@ USAGE
                                 file (~/.locket/cfg)
 
             edit                Edit the cipherstore
-                                The configuration must have an "editor" value, e.g.:
+                                The configuration must have an "edit" value, e.g.:
 
                                     /usr/bin/vim -n ~/.locket.gpg
 
@@ -113,7 +113,7 @@ USAGE
             /<query>            Search the cipherstore for <query> and emit the
                                 resulting secret
                             
-                                The configuration must have a "reader" value to
+                                The configuration must have a "read" value to
                                 tell it how to read the cipherstore. Only piped
                                 commands are supported today, and they should
                                 be something like:
@@ -140,8 +140,8 @@ Example YAML cipherstore
 Example configuration file
         %YAML 1.1
         ---
-        reader: '</usr/local/bin/gpg --no-tty --decrypt --quiet ~/.locket.gpg'
-        editor: '/usr/bin/vim -n ~/.locket.gpg'
+        read: '</usr/local/bin/gpg --no-tty --decrypt --quiet ~/.locket.gpg'
+        edit: '/usr/bin/vim -n ~/.locket.gpg'
 
 AUTHOR
     Robert Krimen <robertkrimen@gmail.com>

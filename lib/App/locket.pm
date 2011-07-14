@@ -1,6 +1,6 @@
 package App::locket;
 BEGIN {
-  $App::locket::VERSION = '0.0021';
+  $App::locket::VERSION = '0.0022';
 }
 # ABSTRACT: Copy secrets from a YAML/JSON cipherstore into the clipboard (pbcopy, xsel, xclip)
 
@@ -48,14 +48,14 @@ $usage = <<_END_;
                             file (~/.locket/cfg)
 
         edit                Edit the cipherstore
-                            The configuration must have an "editor" value, e.g.:
+                            The configuration must have an "edit" value, e.g.:
 
                                 /usr/bin/vim -n ~/.locket.gpg
 
         /<query>            Search the cipherstore for <query> and emit the
                             resulting secret
                             
-                            The configuration must have a "reader" value to
+                            The configuration must have a "read" value to
                             tell it how to read the cipherstore. Only piped
                             commands are supported today, and they should
                             be something like:
@@ -188,10 +188,14 @@ sub run {
 
 sub _select {
     my $self = shift;
+    my $n = shift;
 
     my $found = $self->found;
-    my $k = $self->stash->{_}[0];
-    my $n = $k2n{ $k };
+    my $k;
+    if ( !defined $n ) {
+        $k = $self->stash->{_}[0];
+        $n = $k2n{ $k };
+    }
 
     return unless defined $found->[ $n ];
     my $target = $found->[ $n ];
@@ -199,12 +203,21 @@ sub _select {
     return ( $target, $entry, $k, $n );
 }
 
+sub get_target_entry {
+    my $self = shift;
+    my $stash = $self->stash;
+    my ( $target, $entry ) = @$stash{qw/ target entry /};
+    if ( !defined $target ) {
+        return $self->_select( 0 );
+    }
+}
+
 my $_show = sub {
     my ( $self, $method ) = @_;
 
     return unless my ( $target, $entry, $k, $n ) = $self->_select;
     $self->emit_entry( $target, $entry );
-    $self->dispatch( '//' );
+    $self->dispatch( '.' );
 };
 
 my $_copy = sub {
@@ -212,6 +225,7 @@ my $_copy = sub {
 
     return unless my ( $target, $entry, $k, $n ) = $self->_select;
     $self->emit_entry( $target, $entry, copy => 1 );
+    $self->dispatch( '.' );
 };
 
 sub emit_entry {
@@ -338,7 +352,7 @@ _END_
         if ( length $plaincfg_edit ) {
             $self->write_cfg( $plaincfg_edit );
             $self->stdout_clear;
-            $self->say_stdout( "# Reloading cfg\n---\n" );
+            $self->say_stdout( "# Reload\n---\n" );
             $self->reload_cfg;
             $self->dispatch( '?' );
         }
@@ -426,7 +440,7 @@ _END_
             system( $edit );
             # TODO If error...
             $self->stdout_clear;
-            $self->say_stdout( "# Reloading\n---\n" );
+            $self->say_stdout( "# Reload\n---\n" );
             $self->locket->reload;
             $self->dispatch( '?' );
 
@@ -519,18 +533,16 @@ _END_
         }
 
         $self->stdout_clear;
-        $self->dispatch( '?' );
-        if ( @query != @result_query ) {
-            $self->say_stdout( sprintf "# Query: %s (%s)", join( '/', @result_query ), join( '/', @query ) );
+        if ( @result_query and @query != @result_query ) {
+            $self->say_stdout( sprintf "# Search: %s (%s)", join( '/', @result_query ), join( '/', @query ) );
         }
         elsif ( @query ) {
-            $self->say_stdout( sprintf "# Query: %s", join '/', @query );
+            $self->say_stdout( sprintf "# Search: %s", join '/', @query );
         }
         else {
-            $self->say_stdout( sprintf "# Query: %s", '<nil>' );
+            $self->say_stdout( sprintf "# Search: %s", '<nil>' );
         }
-
-        $self->say_stdout;
+        $self->say_stdout( "---\n\n" );
         if ( @visible ) {
             my $n = 0;
             $self->say_stdout( "    $n2k{$n++}. $_" ) for @visible;
@@ -548,6 +560,7 @@ _END_
         #$self->say_stdout( sprintf "# Select an entry: [%s]", join '', map { $n2k{$_} } 0 .. @visible - 1 );
         #$self->say_stdout( sprintf "# Show an entry: show <entry>" );
         if ( @visible ) {
+            $self->say_stdout( sprintf "# Unrefine your search: .." );
             $self->say_stdout( sprintf "# Show an entry: show [%s]", join '', map { $n2k{$_} } 0 .. @visible - 1 );
             $self->say_stdout( sprintf "# Copy the an entry to the clipboard: copy <entry>" );
         }
@@ -578,6 +591,8 @@ _END_
     reload => sub {
         my ( $self, $method ) = @_;
         $self->reload_cfg;
+        $self->stdout_clear;
+        $self->say_stdout( "# Reload\n---\n" );
         $self->dispatch( '?' );
     },
 
@@ -591,8 +606,7 @@ _END_
         my $query = $self->query;
 
         $self->stdout_clear;
-        $self->dispatch( '?' );
-        $self->say_stdout( sprintf "    === %s ===\n\n", $target );
+        $self->say_stdout( "# Select $k ($target)\n---\n" );
         $self->say_stdout( "# Show entry ($target): show" );
         $self->say_stdout( "# Copy the entry into the clipboard: copy" );
         $self->say_stdout( sprintf "# Show last search: / (%s)", join '/', @$query ) if @$query;
@@ -601,11 +615,9 @@ _END_
 
     qr/^s(?:h(?:o?)?)?$/ => 'show',
     show => sub {
-   
         my ( $self, $method ) = @_;
 
-        my $stash = $self->stash;
-        my ( $target, $entry ) = @$stash{qw/ target entry /};
+        my ( $target, $entry ) = $self->get_target_entry;
         return unless defined $target;
         $self->emit_entry( $target, $entry );
         $self->dispatch( '.' );
@@ -615,8 +627,7 @@ _END_
     copy => sub {
         my ( $self, $method ) = @_;
 
-        my $stash = $self->stash;
-        my ( $target, $entry ) = @$stash{qw/ target entry /};
+        my ( $target, $entry ) = $self->get_target_entry;
         return unless defined $target;
         $self->emit_entry( $target, $entry, copy => 1 );
     },
@@ -1003,7 +1014,7 @@ App::locket - Copy secrets from a YAML/JSON cipherstore into the clipboard (pbco
 
 =head1 VERSION
 
-version 0.0021
+version 0.0022
 
 =head1 SYNOPSIS
 
@@ -1104,7 +1115,7 @@ L<http://search.cpan.org/perldoc?App::cpanminus#INSTALLATION>
                             file (~/.locket/cfg)
 
         edit                Edit the cipherstore
-                            The configuration must have an "editor" value, e.g.:
+                            The configuration must have an "edit" value, e.g.:
 
                                 /usr/bin/vim -n ~/.locket.gpg
 
@@ -1112,7 +1123,7 @@ L<http://search.cpan.org/perldoc?App::cpanminus#INSTALLATION>
         /<query>            Search the cipherstore for <query> and emit the
                             resulting secret
                             
-                            The configuration must have a "reader" value to
+                            The configuration must have a "read" value to
                             tell it how to read the cipherstore. Only piped
                             commands are supported today, and they should
                             be something like:
@@ -1141,8 +1152,8 @@ L<http://search.cpan.org/perldoc?App::cpanminus#INSTALLATION>
 
     %YAML 1.1
     ---
-    reader: '</usr/local/bin/gpg --no-tty --decrypt --quiet ~/.locket.gpg'
-    editor: '/usr/bin/vim -n ~/.locket.gpg'
+    read: '</usr/local/bin/gpg --no-tty --decrypt --quiet ~/.locket.gpg'
+    edit: '/usr/bin/vim -n ~/.locket.gpg'
 
 =head1 AUTHOR
 

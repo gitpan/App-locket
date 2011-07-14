@@ -147,16 +147,14 @@ sub read {
 
     my $reader = $self->cfg->{ read };
     $reader = '' unless defined $reader;
-    if ( $reader =~ m/^\s*[|<]/ ) {
-        ( my $pipe = $reader ) =~ s/^\s*[|<]//;
-        CORE::open( my $cipher, '-|', $pipe );
-        my $plainstore = join '', <$cipher>;
-        chomp $plainstore;
-        return "$plainstore\n";
-    }
-    else {
-        die "*** Unknown/invalid reader ($reader)";
-    }
+    $reader =~ s/^\s*[|<]//;
+    my $pipe = $reader;
+    CORE::open( my $cipher, '-|', $pipe );
+    my $plainstore = join '', <$cipher>;
+    chomp $plainstore;
+    return "$plainstore\n";
+
+    die "*** Unknown/invalid reader ($reader)";
 }
 
 sub load {
